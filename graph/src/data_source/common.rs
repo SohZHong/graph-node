@@ -4,6 +4,9 @@ use crate::abi::FunctionExt;
 use crate::blockchain::block_stream::EntitySourceOperation;
 use crate::prelude::{BlockPtr, Value};
 use crate::{components::link_resolver::LinkResolver, data::value::Word, prelude::Link};
+use alloy::primitives::Address;
+use alloy::primitives::U256;
+use alloy::rpc::types::Log;
 use anyhow::{anyhow, Context, Error};
 use graph_derive::CheapClone;
 use lazy_static::lazy_static;
@@ -13,8 +16,6 @@ use serde::de;
 use serde::Deserialize;
 use slog::Logger;
 use std::{str::FromStr, sync::Arc};
-use web3::types::Address;
-use web3::types::{Log, H160};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MappingABI {
@@ -129,11 +130,15 @@ impl CallDecl {
         self.expr.validate_args()
     }
 
-    pub fn address_for_log(&self, log: &Log, params: &[abi::DynSolParam]) -> Result<H160, Error> {
+    pub fn address_for_log(
+        &self,
+        log: &Log,
+        params: &[abi::DynSolParam],
+    ) -> Result<Address, Error> {
         let address = match &self.expr.address {
             CallArg::HexAddress(address) => *address,
             CallArg::Ethereum(arg) => match arg {
-                EthereumArg::Address => log.address,
+                EthereumArg::Address => log.address(),
                 EthereumArg::Param(name) => {
                     let value = &params
                         .iter()
@@ -168,13 +173,9 @@ impl CallDecl {
             .args
             .iter()
             .map(|arg| match arg {
-                CallArg::HexAddress(address) => {
-                    Ok(DynSolValue::Address(address.to_fixed_bytes().into()))
-                }
+                CallArg::HexAddress(address) => Ok(DynSolValue::Address(*address)),
                 CallArg::Ethereum(arg) => match arg {
-                    EthereumArg::Address => {
-                        Ok(DynSolValue::Address(log.address.to_fixed_bytes().into()))
-                    }
+                    EthereumArg::Address => Ok(DynSolValue::Address(log.address())),
                     EthereumArg::Param(name) => {
                         let value = params
                             .iter()
@@ -219,7 +220,7 @@ impl CallDecl {
     pub fn address_for_entity_handler(
         &self,
         entity: &EntitySourceOperation,
-    ) -> Result<H160, Error> {
+    ) -> Result<Address, Error> {
         match &self.expr.address {
             // Static hex address - just return it directly
             CallArg::HexAddress(address) => Ok(*address),
@@ -240,7 +241,7 @@ impl CallDecl {
                 // Make sure it's a bytes value and convert to address
                 match value {
                     Value::Bytes(bytes) => {
-                        let address = H160::from_slice(bytes.as_slice());
+                        let address = Address::from_slice(bytes.as_slice());
                         Ok(address)
                     }
                     _ => Err(anyhow!("param '{name}' must be an address")),
@@ -302,13 +303,11 @@ impl CallDecl {
     /// Converts a hex address to a token, ensuring it matches the expected parameter type.
     fn process_hex_address(
         &self,
-        address: H160,
+        address: Address,
         expected_type: &abi::DynSolType,
     ) -> Result<abi::DynSolValue, Error> {
         match expected_type {
-            abi::DynSolType::Address => {
-                Ok(abi::DynSolValue::Address(address.to_fixed_bytes().into()))
-            }
+            abi::DynSolType::Address => Ok(abi::DynSolValue::Address(address)),
             _ => Err(anyhow!(
                 "type mismatch: hex address provided for non-address parameter"
             )),
@@ -360,15 +359,15 @@ impl CallDecl {
                 Ok(DynSolValue::Int(x, x.bits() as usize))
             }
             (DynSolType::Int(_), Value::BigInt(i)) => {
-                let x = abi::I256::from_limbs(i.to_signed_u256().0);
+                let x = abi::I256::from_le_bytes(i.to_signed_u256().to_le_bytes::<{U256::BYTES}>());
                 Ok(DynSolValue::Int(x, x.bits() as usize))
             }
             (DynSolType::Uint(_), Value::Int(i)) if *i >= 0 => {
-                let x = abi::U256::try_from(*i)?;
+                let x = U256::try_from(*i)?;
                 Ok(DynSolValue::Uint(x, x.bit_len()))
             }
             (DynSolType::Uint(_), Value::BigInt(i)) if i.sign() == Sign::Plus => {
-                let x = abi::U256::from_limbs(i.to_unsigned_u256().0);
+                let x = i.to_unsigned_u256();
                 Ok(DynSolValue::Uint(x, x.bit_len()))
             }
             (DynSolType::Array(inner_type), Value::List(values)) => {
@@ -579,7 +578,7 @@ impl DeclaredCall {
     pub fn from_log_trigger(
         mapping: &dyn FindMappingABI,
         call_decls: &CallDecls,
-        log: &Log,
+        log: &alloy::rpc::types::Log,
         params: &[abi::DynSolParam],
     ) -> Result<Vec<DeclaredCall>, Error> {
         Self::create_calls(mapping, call_decls, |decl, _| {
@@ -643,7 +642,7 @@ impl DeclaredCall {
         (
             ContractCall {
                 contract_name: self.contract_name,
-                address: alloy::primitives::Address::from(self.address.as_fixed_bytes()),
+                address: self.address,
                 block_ptr,
                 function: self.function,
                 args: self.args,
@@ -728,7 +727,7 @@ mod tests {
     #[test]
     fn test_hex_address_call_expr() {
         let addr = "0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF";
-        let hex_address = CallArg::HexAddress(web3::types::H160::from_str(addr).unwrap());
+        let hex_address = CallArg::HexAddress(Address::from_str(addr).unwrap());
 
         // Test HexAddress in address position
         let expr: CallExpr = format!("Pool[{}].growth()", addr).parse().unwrap();
